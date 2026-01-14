@@ -1,0 +1,59 @@
+# Example YAML configuration for training LSTM model on SignalTrain LA2A dataset
+# Usage: python train.py --config config.example.yaml
+
+dataset:
+  root_dir: "/data/signaltrain"
+  train_subset: "Train"
+  val_subset: "Val"
+  test_subset: "Test"
+  train_length: 65536      # ~1.5 seconds at 44.1kHz
+  eval_length: 131072       # ~3 seconds at 44.1kHz
+  sample_rate: 44100
+  n_params: 2               # LA2A has 2 parameters: gain and ratio
+  batch_size: 8
+  num_workers: 4
+  preload: false
+  half_precision: false
+  shuffle: true
+  pin_memory: true
+
+model:
+  model_type: "lstm"
+  hidden_size: 256
+  num_layers: 2
+  dropout: 0.1
+  use_params: true          # Whether to condition on LA2A parameters
+
+training:
+  num_epochs: 100
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-5
+  optimizer: "adamw"
+  scheduler: "reduce_on_plateau"
+  scheduler_patience: 5
+  scheduler_factor: 0.5
+  early_stopping_patience: 20
+  log_every_n_steps: 10
+  precision: "32"           # Options: "32", "16-mixed", "bf16-mixed"
+  accelerator: "auto"       # Options: "auto", "cpu", "gpu", "mps"
+  devices: 1
+  gradient_clip_norm: null  # Set to a float value to enable gradient clipping
+
+experiment_name: "signaltrain_lstm_experiment"
+description: "LSTM model for audio-to-audio transformation on SignalTrain LA2A dataset"
+tags:
+  - "lstm"
+  - "audio"
+  - "la2a"
+  - "neural-profiler"
+
+project: "neural-profiler"
+run_name: null              # If null, uses experiment_name
+wandb_entity: null          # Your W&B entity/username (optional)
+
+output_dir: "./outputs"
+checkpoint_dir: "./checkpoints"
+log_dir: "./logs"
+
+seed: 42
+deterministic: true
