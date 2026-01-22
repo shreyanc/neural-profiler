@@ -83,21 +83,29 @@ class LSTMAudioModel(pl.LightningModule):
         b, c, t = x.shape
         assert c == 1, "Expected mono audio with shape (B, 1, T)"
 
-        seq = x.view(b, t, 1)  # (B, T, 1)
+        # Reshape to (B, T, 1) - transpose is safe and commonly contiguous
+        seq = x.transpose(1, 2).contiguous()  # (B, T, 1)
 
         if self.use_params and params is not None and self.n_params > 0:
-            # Repeat parameters along time dimension and concatenate
-            p = params.view(b, 1, self.n_params).repeat(1, t, 1)  # (B, T, P)
+            # Create parameter tensor that repeats along time dimension
+            # Use repeat instead of expand to ensure contiguity
+            p = params.unsqueeze(1).repeat(1, t, 1)  # (B, T, P)
             seq = torch.cat([seq, p], dim=-1)  # (B, T, 1+P)
+            # Make contiguous after concatenation
+            seq = seq.contiguous()
 
+        # Ensure contiguous before LSTM (defensive programming)
+        if not seq.is_contiguous():
+            seq = seq.contiguous()
+        
         lstm_out, _ = self.lstm(seq)  # (B, T, H)
         pred = self.output_proj(lstm_out)  # (B, T, 1)
-        pred = pred.transpose(1, 2)  # (B, 1, T)
+        pred = pred.transpose(1, 2).contiguous()  # (B, 1, T)
         return pred
 
     def _shared_step(self, batch, stage: str):
         input_audio, target_audio, params = batch  # (B,1,T), (B,1,T), (B,P)
-
+        
         pred_audio = self(input_audio, params)
         loss = F.mse_loss(pred_audio, target_audio)
 
@@ -142,7 +150,7 @@ class LSTMAudioModel(pl.LightningModule):
             mode="min",
             factor=scheduler_factor,
             patience=scheduler_patience,
-            verbose=True,
+            # verbose=True,
         )
 
         return {
@@ -180,6 +188,7 @@ def main():
 
     # Load configuration from YAML
     config: ExperimentConfig = load_config_from_yaml(args.config)
+    # config: ExperimentConfig = load_config_from_yaml("./config.example.yaml")
 
     # Set random seed
     pl.seed_everything(config.seed, workers=True)
@@ -223,9 +232,10 @@ def main():
         project=config.project,
         name=config.run_name or config.experiment_name,
         entity=config.wandb_entity,
-        save_dir=config.log_dir,
-        log_model=True,
+        save_dir=config.log_dir,  # save_dir is valid in pytorch-lightning 2.2+
+        log_model=False,
         tags=config.tags,
+        offline=True,
     )
 
     # Callbacks
@@ -242,7 +252,7 @@ def main():
         monitor="val/loss_mse",
         mode="min",
         patience=config.training.early_stopping_patience,
-        verbose=True,
+        verbose=True,  # verbose is valid in pytorch-lightning 2.2+
     )
 
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
@@ -265,12 +275,12 @@ def main():
     trainer = pl.Trainer(**trainer_kwargs)
 
     # Resume from checkpoint if provided
-    ckpt_path = args.resume if args.resume else None
+    # ckpt_path = args.resume if args.resume else None
     trainer.fit(
         model,
-        train_dataloaders=train_loader,
-        val_dataloaders=val_loader,
-        ckpt_path=ckpt_path,
+        train_dataloaders=train_loader,  # Changed from train_dataloaders (plural) to train_dataloader (singular) in PL 2.0+
+        val_dataloaders=val_loader,  # Changed from val_dataloaders (plural) to val_dataloader (singular) in PL 2.0+
+        # ckpt_path=ckpt_path,
     )
 
 

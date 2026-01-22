@@ -2,7 +2,11 @@
 # Usage: python train.py --config config.example.yaml
 
 dataset:
-  root_dir: "/data/signaltrain"
+  # Update this path based on where your dataset was synced
+  # If synced with target_subdir="SignalTrain_LA2A_Dataset_1.1", use:
+  root_dir: "/data/signaltrain/SignalTrain_LA2A_Dataset_1.1"
+  # If synced directly to /data/signaltrain/, use:
+  # root_dir: "/data/signaltrain"
   train_subset: "Train"
   val_subset: "Val"
   test_subset: "Test"
