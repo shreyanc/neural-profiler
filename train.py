@@ -1,47 +1,33 @@
-"""
-Training script for mapping input audio signals to target signals
-using an LSTM-based architecture with PyTorch Lightning and Weights & Biases.
+#!/usr/bin/env python3
+"""Training script for LSTM-based audio-to-audio model on SignalTrain LA2A dataset.
 
-The script expects the SignalTrain LA2A dataset structure used by `dataloader.py`
-and trains a sequence-to-sequence regression model that predicts the processed
-audio given the clean input (optionally conditioned on LA2A parameters).
+This script provides the model architecture and training functions that can be used
+standalone or imported by modal_app.py for training on Modal.
 """
 
-import argparse
-import os
-from typing import Optional
+import sys
+from pathlib import Path
+from typing import Optional, Dict, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import pytorch_lightning as pl
-from pytorch_lightning.callbacks import (
-    ModelCheckpoint,
-    EarlyStopping,
-    LearningRateMonitor,
-)
-from pytorch_lightning.loggers import WandbLogger
-
-from dataloader import (
-    DatasetConfig as DataConfigForLoader,
-    create_dataloaders,
-    compute_audio_metrics,
-)
-from config import load_config_from_yaml, ExperimentConfig
+from dataloader import DatasetConfig as DataConfigForLoader, create_dataloaders
+from config import ExperimentConfig, load_config_from_yaml
 
 
-class LSTMAudioModel(pl.LightningModule):
+class LSTMAudioModel(nn.Module):
     """
     LSTM-based model for audio-to-audio regression.
-
+    
     Inputs:
         - input_audio: (B, 1, T)
         - params:      (B, P) optional conditioning parameters
     Output:
         - pred_audio:  (B, 1, T)
     """
-
+    
     def __init__(
         self,
         input_length: int,
@@ -49,19 +35,15 @@ class LSTMAudioModel(pl.LightningModule):
         hidden_size: int = 256,
         num_layers: int = 2,
         dropout: float = 0.1,
-        lr: float = 1e-4,
-        weight_decay: float = 0.0,
         use_params: bool = True,
     ):
         super().__init__()
-        self.save_hyperparameters()
-
         self.input_length = input_length
         self.n_params = n_params
         self.use_params = use_params
-
+        
         input_size = 1 + (n_params if use_params and n_params > 0 else 0)
-
+        
         self.lstm = nn.LSTM(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -69,9 +51,9 @@ class LSTMAudioModel(pl.LightningModule):
             dropout=dropout if num_layers > 1 else 0.0,
             batch_first=True,
         )
-
+        
         self.output_proj = nn.Linear(hidden_size, 1)
-
+    
     def forward(self, x: torch.Tensor, params: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
@@ -82,19 +64,17 @@ class LSTMAudioModel(pl.LightningModule):
         """
         b, c, t = x.shape
         assert c == 1, "Expected mono audio with shape (B, 1, T)"
-
-        # Reshape to (B, T, 1) - transpose is safe and commonly contiguous
+        
+        # Reshape to (B, T, 1)
         seq = x.transpose(1, 2).contiguous()  # (B, T, 1)
-
+        
         if self.use_params and params is not None and self.n_params > 0:
             # Create parameter tensor that repeats along time dimension
-            # Use repeat instead of expand to ensure contiguity
             p = params.unsqueeze(1).repeat(1, t, 1)  # (B, T, P)
             seq = torch.cat([seq, p], dim=-1)  # (B, T, 1+P)
-            # Make contiguous after concatenation
             seq = seq.contiguous()
-
-        # Ensure contiguous before LSTM (defensive programming)
+        
+        # Ensure contiguous before LSTM
         if not seq.is_contiguous():
             seq = seq.contiguous()
         
@@ -103,97 +83,52 @@ class LSTMAudioModel(pl.LightningModule):
         pred = pred.transpose(1, 2).contiguous()  # (B, 1, T)
         return pred
 
-    def _shared_step(self, batch, stage: str):
-        input_audio, target_audio, params = batch  # (B,1,T), (B,1,T), (B,P)
+
+def train_model(
+    config: ExperimentConfig,
+    device: Optional[torch.device] = None,
+    verbose: bool = True,
+) -> Dict[str, Any]:
+    """
+    Train the LSTM model using the provided configuration.
+    
+    Args:
+        config: Experiment configuration
+        device: PyTorch device (if None, uses cuda if available, else cpu)
+        verbose: Whether to print training progress
         
-        pred_audio = self(input_audio, params)
-        loss = F.mse_loss(pred_audio, target_audio)
-
-        # Basic metrics
-        mae = F.l1_loss(pred_audio, target_audio)
-
-        # Audio metrics on first element to keep it cheap
-        with torch.no_grad():
-            metrics = compute_audio_metrics(pred_audio[0], target_audio[0])
-
-        log_dict = {
-            f"{stage}/loss_mse": loss,
-            f"{stage}/mae": mae,
-            f"{stage}/mse": metrics["mse"],
-            f"{stage}/snr": metrics["snr"],
-            f"{stage}/correlation": metrics["correlation"],
-        }
-
-        self.log_dict(
-            log_dict,
-            prog_bar=(stage == "train"),
-            on_step=(stage == "train"),
-            on_epoch=True,
-        )
-        return loss
-
-    def training_step(self, batch, batch_idx):
-        return self._shared_step(batch, "train")
-
-    def validation_step(self, batch, batch_idx):
-        self._shared_step(batch, "val")
-
-    def configure_optimizers(self):
-        lr = self.hparams.lr
-        weight_decay = self.hparams.weight_decay
-        scheduler_patience = getattr(self.hparams, "scheduler_patience", 5)
-        scheduler_factor = getattr(self.hparams, "scheduler_factor", 0.5)
-
-        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=scheduler_factor,
-            patience=scheduler_patience,
-            # verbose=True,
-        )
-
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
-                "scheduler": scheduler,
-                "monitor": "val/loss_mse",
-                "interval": "epoch",
-                "frequency": 1,
-            },
-        }
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Train LSTM model for SignalTrain LA2A dataset using YAML config",
-    )
-    parser.add_argument(
-        "--config",
-        type=str,
-        required=True,
-        help="Path to YAML configuration file",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        help="Path to checkpoint to resume training from (optional)",
-    )
-    return parser.parse_args()
-
-
-def main():
-    args = parse_args()
-
-    # Load configuration from YAML
-    config: ExperimentConfig = load_config_from_yaml(args.config)
-    # config: ExperimentConfig = load_config_from_yaml("./config.example.yaml")
-
-    # Set random seed
-    pl.seed_everything(config.seed, workers=True)
-
-    # Data configuration uses the DatasetConfig defined in dataloader.py
+    Returns:
+        Dictionary with training results including final losses and metrics
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if verbose:
+        print("=" * 80)
+        print("TRAINING LSTM MODEL")
+        print("=" * 80)
+        print(f"Device: {device}")
+        print(f"Dataset root: {config.dataset.root_dir}")
+        print(f"Train subset: {config.dataset.train_subset}")
+        print(f"Val subset: {config.dataset.val_subset}")
+        print(f"Train length: {config.dataset.train_length}")
+        print(f"Eval length: {config.dataset.eval_length}")
+        print(f"Batch size: {config.dataset.batch_size}")
+        print(f"Num workers: {config.dataset.num_workers}")
+        print(f"Num epochs: {config.training.num_epochs}")
+        print(f"Learning rate: {config.training.learning_rate}")
+        print(f"LSTM hidden size: {config.model.hidden_size}")
+        print(f"LSTM num layers: {config.model.num_layers}")
+        print(f"LSTM dropout: {config.model.dropout}")
+        print(f"Use params: {config.model.use_params}")
+        print("=" * 80)
+    
+    # Set random seed for reproducibility
+    torch.manual_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
+    
+    # Create data configuration
     data_config = DataConfigForLoader(
         root_dir=config.dataset.root_dir,
         train_subset=config.dataset.train_subset,
@@ -209,81 +144,225 @@ def main():
         shuffle=config.dataset.shuffle,
         pin_memory=config.dataset.pin_memory,
     )
-
+    
+    # Create dataloaders
+    if verbose:
+        print("\nCreating dataloaders...")
     train_loader, val_loader, _ = create_dataloaders(data_config)
-
-    # Create model from config
+    if verbose:
+        print(f"✓ Dataloaders created")
+    
+    # Create model
+    if verbose:
+        print("\nCreating LSTM model...")
     model = LSTMAudioModel(
         input_length=config.model.input_length,
         n_params=config.model.n_params,
         hidden_size=config.model.hidden_size,
         num_layers=config.model.num_layers,
         dropout=config.model.dropout,
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
         use_params=config.model.use_params,
     )
-    # Store scheduler config in model for configure_optimizers
-    model.hparams.scheduler_patience = config.training.scheduler_patience
-    model.hparams.scheduler_factor = config.training.scheduler_factor
-
-    # WandB logger
-    wandb_logger = WandbLogger(
-        project=config.project,
-        name=config.run_name or config.experiment_name,
-        entity=config.wandb_entity,
-        save_dir=config.log_dir,  # save_dir is valid in pytorch-lightning 2.2+
-        log_model=False,
-        tags=config.tags,
-        offline=True,
-    )
-
-    # Callbacks
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=config.checkpoint_dir,
-        filename="lstm-audio-{epoch:02d}-{val_loss_mse:.5f}",
-        save_top_k=3,
-        monitor="val/loss_mse",
-        mode="min",
-        save_last=True,
-    )
-
-    early_stopping = EarlyStopping(
-        monitor="val/loss_mse",
-        mode="min",
-        patience=config.training.early_stopping_patience,
-        verbose=True,  # verbose is valid in pytorch-lightning 2.2+
-    )
-
-    lr_monitor = LearningRateMonitor(logging_interval="epoch")
-
-    # Build trainer from config
-    trainer_kwargs = {
-        "max_epochs": config.training.num_epochs,
-        "logger": wandb_logger,
-        "callbacks": [checkpoint_callback, early_stopping, lr_monitor],
-        "accelerator": config.training.accelerator,
-        "devices": config.training.devices,
-        "precision": config.training.precision,
-        "log_every_n_steps": config.training.log_every_n_steps,
-        "deterministic": config.deterministic,
+    model = model.to(device)
+    if verbose:
+        print(f"✓ Model created: {model}")
+        print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,} total")
+    
+    # Create optimizer
+    if config.training.optimizer.lower() == "adamw":
+        optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=config.training.learning_rate,
+            weight_decay=config.training.weight_decay,
+        )
+    elif config.training.optimizer.lower() == "adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=config.training.learning_rate,
+            weight_decay=config.training.weight_decay,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {config.training.optimizer}")
+    
+    # Create scheduler
+    if config.training.scheduler.lower() == "reduce_on_plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=config.training.scheduler_factor,
+            patience=config.training.scheduler_patience,
+            verbose=verbose,
+        )
+    else:
+        scheduler = None
+    
+    # Training loop
+    if verbose:
+        print("\n" + "=" * 80)
+        print("TRAINING")
+        print("=" * 80)
+    
+    best_val_loss = float("inf")
+    patience_counter = 0
+    
+    for epoch in range(config.training.num_epochs):
+        if verbose:
+            print(f"\nEpoch {epoch + 1}/{config.training.num_epochs}")
+        
+        # Training
+        model.train()
+        train_loss = 0.0
+        train_batches = 0
+        
+        for batch_idx, (input_audio, target_audio, params) in enumerate(train_loader):
+            input_audio = input_audio.to(device)
+            target_audio = target_audio.to(device)
+            params = params.to(device)
+            
+            # Forward pass
+            pred_audio = model(input_audio, params)
+            
+            # Compute loss
+            loss = F.mse_loss(pred_audio, target_audio)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            
+            # Gradient clipping if specified
+            if config.training.gradient_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(), config.training.gradient_clip_norm
+                )
+            
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_batches += 1
+            
+            if verbose and (batch_idx + 1) % config.training.log_every_n_steps == 0:
+                avg_loss = train_loss / train_batches
+                print(f"  Batch {batch_idx + 1}: loss = {loss.item():.6f}, avg_loss = {avg_loss:.6f}")
+        
+        avg_train_loss = train_loss / train_batches if train_batches > 0 else 0.0
+        if verbose:
+            print(f"  Train loss: {avg_train_loss:.6f} ({train_batches} batches)")
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        
+        with torch.no_grad():
+            for batch_idx, (input_audio, target_audio, params) in enumerate(val_loader):
+                input_audio = input_audio.to(device)
+                target_audio = target_audio.to(device)
+                params = params.to(device)
+                
+                pred_audio = model(input_audio, params)
+                loss = F.mse_loss(pred_audio, target_audio)
+                
+                val_loss += loss.item()
+                val_batches += 1
+        
+        avg_val_loss = val_loss / val_batches if val_batches > 0 else 0.0
+        if verbose:
+            print(f"  Val loss: {avg_val_loss:.6f} ({val_batches} batches)")
+        
+        # Update learning rate scheduler
+        if scheduler is not None:
+            scheduler.step(avg_val_loss)
+            if verbose:
+                current_lr = optimizer.param_groups[0]["lr"]
+                print(f"  Learning rate: {current_lr:.2e}")
+        
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            
+            # Save best model checkpoint
+            checkpoint_path = Path(config.checkpoint_dir) / "best_model.pt"
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": avg_val_loss,
+                    "train_loss": avg_train_loss,
+                    "config": config,
+                },
+                checkpoint_path,
+            )
+            if verbose:
+                print(f"  ✓ Saved best model checkpoint (val_loss: {avg_val_loss:.6f})")
+        else:
+            patience_counter += 1
+            if patience_counter >= config.training.early_stopping_patience:
+                if verbose:
+                    print(f"\nEarly stopping triggered after {epoch + 1} epochs")
+                    print(f"Best val loss: {best_val_loss:.6f}")
+                break
+    
+    if verbose:
+        print("\n" + "=" * 80)
+        print("TRAINING COMPLETE")
+        print("=" * 80)
+        print(f"Final train loss: {avg_train_loss:.6f}")
+        print(f"Final val loss: {avg_val_loss:.6f}")
+        print(f"Best val loss: {best_val_loss:.6f}")
+    
+    return {
+        "final_train_loss": avg_train_loss,
+        "final_val_loss": avg_val_loss,
+        "best_val_loss": best_val_loss,
+        "train_batches": train_batches,
+        "val_batches": val_batches,
+        "epochs_completed": epoch + 1,
     }
 
-    if config.training.gradient_clip_norm is not None:
-        trainer_kwargs["gradient_clip_val"] = config.training.gradient_clip_norm
 
-    trainer = pl.Trainer(**trainer_kwargs)
-
-    # Resume from checkpoint if provided
-    # ckpt_path = args.resume if args.resume else None
-    trainer.fit(
-        model,
-        train_dataloaders=train_loader,  # Changed from train_dataloaders (plural) to train_dataloader (singular) in PL 2.0+
-        val_dataloaders=val_loader,  # Changed from val_dataloaders (plural) to val_dataloader (singular) in PL 2.0+
-        # ckpt_path=ckpt_path,
+def main():
+    """Main entry point for standalone training."""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train LSTM model on SignalTrain LA2A dataset")
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="config.example.yaml",
+        help="Path to configuration YAML file",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use (cuda/cpu). If not specified, auto-detects.",
+    )
+    
+    args = parser.parse_args()
+    
+    # Load configuration
+    config = load_config_from_yaml(args.config)
+    
+    # Set device
+    if args.device is None:
+        device = None  # Will auto-detect in train_model
+    else:
+        device = torch.device(args.device)
+    
+    # Train model
+    results = train_model(config, device=device, verbose=True)
+    
+    print("\n" + "=" * 80)
+    print("RESULTS")
+    print("=" * 80)
+    import json
+    print(json.dumps(results, indent=2))
+    
+    return results
 
 
 if __name__ == "__main__":
     main()
-
