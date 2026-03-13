@@ -1,0 +1,129 @@
+# Minimal configuration for train_step_by_step.py
+# This config is used for step-by-step training on Modal
+
+dataset:
+  # Path and subsets
+  root_dir: "/data/signaltrain/SignalTrain_LA2A_Dataset_1.1"
+  train_subset: "Train"
+  val_subset: "Val"
+  test_subset: "Test"
+
+  # Audio geometry (paper: 65536 train, micro-tcn test uses 8388608 for eval)
+  # Short segments (e.g. 22050) inflate LUFS error and hurt STFT; use ≥65536 for comparable metrics.
+  train_length: 132300          # 44100 * 3 (~3 s at 44.1 kHz)
+  eval_length: 132300           # 44100 * 3 (~3 s at 44.1 kHz)
+  sample_rate: 44100
+
+  # Hardware parameters (for models that use conditioning)
+  n_params: 2                  # LA2A has 2 parameters: gain and ratio
+
+  # Dataloader settings (paper uses batch_size 32; reduce if OOM)
+  batch_size: 8
+  num_workers: 8
+  preload: true
+  half_precision: false
+  shuffle: true
+  pin_memory: true
+
+model:
+  # Set to one of: TestLSTM, ResidualLSTM, ReferenceLSTM,
+  # SimpleHardwareEmulationLSTM, HardwareEmulationLSTM, TCNModel, CausalBlockLSTM
+  model_type: "ReferenceLSTM"
+
+  # ------------------------------------------------------------------
+  # TestLSTM
+  # ------------------------------------------------------------------
+  test_lstm:
+    hidden_size: 128
+    num_layers: 1
+    dropout: 0.0
+    learning_rate: 1.0e-4
+
+  # ------------------------------------------------------------------
+  # ResidualLSTM
+  # ------------------------------------------------------------------
+  residual_lstm:
+    hidden_size: 64
+    num_layers: 1
+    dropout: 0.0
+    learning_rate: 1.0e-4
+
+  # ------------------------------------------------------------------
+  # CausalBlockLSTM (causal LSTM with block-wise processing for long sequences)
+  # ------------------------------------------------------------------
+  causal_block_lstm:
+    hidden_size: 64
+    num_layers: 1
+    dropout: 0.0
+    block_size: 22050
+    learning_rate: 1.0e-4
+
+  # ------------------------------------------------------------------
+  # ReferenceLSTM (micro-TCN reference LSTM)
+  # ------------------------------------------------------------------
+  reference_lstm:
+    n_inputs: 1
+    n_outputs: 1
+    hidden_size: 64
+    num_layers: 2
+    learning_rate: 1.0e-4
+
+  # ------------------------------------------------------------------
+  # SimpleHardwareEmulationLSTM
+  # ------------------------------------------------------------------
+  simple_hardware_emulation_lstm:
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.1
+    learning_rate: 1.0e-4
+
+  # ------------------------------------------------------------------
+  # HardwareEmulationLSTM
+  # ------------------------------------------------------------------
+  hardware_emulation_lstm:
+    hidden_size: 256
+    num_layers: 3
+    dropout: 0.1
+    param_embed_dim: 64
+    use_bidirectional: true
+    use_residual: true
+    use_skip_connection: true
+    learning_rate: 1.0e-4
+
+  # ------------------------------------------------------------------
+  # TCNModel (micro-TCN)
+  # ------------------------------------------------------------------
+  tcn:
+    ninputs: 1
+    noutputs: 1
+    nblocks: 4
+    kernel_size: 13
+    dilation_growth: 10
+    channel_growth: 1
+    channel_width: 32
+    stack_size: 10
+    grouped: false
+    causal: true
+    skip_connections: false
+    learning_rate: 1.0e-4
+
+
+training:
+  num_epochs: 70         # Paper VI-C: 60 epochs; LR reduced after 10 epochs without val improvement
+  learning_rate: 3.0e-4  # Paper: initial 3e-4 (then /10 after 10 epochs no improvement)
+  gradient_accumulation_steps: 4  # effective batch = 8*4 = 32 (paper uses batch 32)
+  precision: "bf16-mixed"  # "32" | "16-mixed" | "bf16-mixed"
+  loss: "l1_stft"        # Paper Eq.8: MAE + STFT (l1_stft = L1 + STFT)
+  pre_emphasis: "high_pass"   # Paper: only augmentation is phase inversion; try "none" for paper parity
+  pre_emphasis_coeff: 0.95
+  # ReduceLROnPlateau: paper "decreasing the learning rate by a factor of 10 after the validation
+  # loss has not improved for 10 epochs". Set lr_scheduler_patience to null to disable.
+  lr_scheduler_patience: 10
+  lr_scheduler_factor: 0.1
+
+experiment_name: "lstm32-la2a"
+project: "neural-profiler"
+wandb_entity: null
+
+# MLflow model registry: when set, the best model is registered under this name
+mlflow_registered_model_name: "neural-profiler"

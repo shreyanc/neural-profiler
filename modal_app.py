@@ -41,8 +41,8 @@ image = (
         "torch>=2.1.2",
         "torchvision>=0.16.1",
         # Training stack
-        "pytorch-lightning>=2.2.0",
         "wandb>=0.16.0",
+        "tqdm>=4.66.0",
     )
     # Include project code so imports resolve even outside the mounted path
     .add_local_dir(Path(__file__).parent, remote_path=WORKDIR)
@@ -603,73 +603,78 @@ def test_dataloader(root_dir: str = "/data/signaltrain/SignalTrain_LA2A_Dataset_
         modal.Secret.from_name("wandb")  # Expects WANDB_API_KEY
     ],
 )
-def run_training(config_path: str = f"{WORKDIR}/config.modal.default.yaml", resume: str | None = None):
-    """Run training on Modal using PyTorch Lightning with full features from train.py."""
+def run_training(
+    root_dir: str = "/data/signaltrain/SignalTrain_LA2A_Dataset_1.1",
+    train_subset: str = "Train",
+    val_subset: str = "Val",
+    train_length: int = 65536,
+    eval_length: int = 131072,
+    batch_size: int = 8,
+    num_workers: int = 4,
+    n_params: int = 2,
+    num_epochs: int = 10,
+    learning_rate: float = 1e-4,
+    hidden_size: int = 256,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    use_params: bool = True,
+):
+    """Minimal training loop with identity model - using functions from train_minimal_modal.py."""
     import sys
-    from typing import Optional
+    import torch
+    import torch.nn.functional as F
+    import wandb
+    from tqdm import tqdm
     
     sys.path.insert(0, WORKDIR)
     
-    import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
-    
-    import pytorch_lightning as pl
-    from pytorch_lightning.callbacks import (
-        ModelCheckpoint,
-        EarlyStopping,
-        LearningRateMonitor,
-    )
-    from pytorch_lightning.loggers import WandbLogger
-    
-    from dataloader import (
-        DatasetConfig as DataConfigForLoader,
-        create_dataloaders,
-        compute_audio_metrics,
-    )
-    from config import load_config_from_yaml, ExperimentConfig
-    from train import LSTMAudioModel as BaseLSTMAudioModel
+    from dataloader import DatasetConfig as DataConfigForLoader, create_dataloaders
     
     print("=" * 80)
-    print("TRAINING ON MODAL WITH PYTORCH LIGHTNING")
+    print("MINIMAL TRAINING WITH IDENTITY MODEL")
     print("=" * 80)
-    print(f"Config path: {config_path}")
-    print(f"Resume from: {resume if resume else 'None'}")
+    print(f"Dataset root: {root_dir}")
+    print(f"Train subset: {train_subset}")
+    print(f"Val subset: {val_subset}")
+    print(f"Train length: {train_length}")
+    print(f"Eval length: {eval_length}")
+    print(f"Batch size: {batch_size}")
+    print(f"Num workers: {num_workers}")
+    print(f"Num epochs: {num_epochs}")
+    print(f"Learning rate: {learning_rate}")
+    print(f"LSTM hidden size: {hidden_size}")
+    print(f"LSTM num layers: {num_layers}")
+    print(f"LSTM dropout: {dropout}")
+    print(f"Use params: {use_params}")
     print("=" * 80)
     
-    # Load configuration from YAML
-    config: ExperimentConfig = load_config_from_yaml(config_path)
-    
-    # Set random seed
-    pl.seed_everything(config.seed, workers=True)
-    
-    # Data configuration uses the DatasetConfig defined in dataloader.py
+    # Create data configuration
     data_config = DataConfigForLoader(
-        root_dir=config.dataset.root_dir,
-        train_subset=config.dataset.train_subset,
-        val_subset=config.dataset.val_subset,
-        test_subset=config.dataset.test_subset,
-        train_length=config.dataset.train_length,
-        eval_length=config.dataset.eval_length,
-        batch_size=config.dataset.batch_size,
-        num_workers=config.dataset.num_workers,
-        n_params=config.dataset.n_params,
-        preload=config.dataset.preload,
-        half_precision=config.dataset.half_precision,
-        shuffle=config.dataset.shuffle,
-        pin_memory=config.dataset.pin_memory,
+        root_dir=root_dir,
+        train_subset=train_subset,
+        val_subset=val_subset,
+        test_subset="Test",
+        train_length=train_length,
+        eval_length=eval_length,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        n_params=n_params,
+        preload=False,
+        half_precision=False,
+        shuffle=True,
+        pin_memory=True,
     )
     
+    # Create dataloaders
     print("\nCreating dataloaders...")
     train_loader, val_loader, _ = create_dataloaders(data_config)
-    print("✓ Dataloaders created")
+    print(f"✓ Dataloaders created")
     
-    # Define LSTM model using the model from train.py wrapped in Lightning
-    class LSTMAudioModel(pl.LightningModule):
+    # Create LSTM model (from train_minimal_modal.py)
+    print("\nCreating LSTM model...")
+    class LSTMAudioModel(torch.nn.Module):
         """
-        PyTorch Lightning wrapper for LSTM-based audio-to-audio regression model.
-        
-        Uses the LSTMAudioModel from train.py as the base model.
+        LSTM-based model for audio-to-audio regression.
         
         Inputs:
             - input_audio: (B, 1, T)
@@ -677,7 +682,6 @@ def run_training(config_path: str = f"{WORKDIR}/config.modal.default.yaml", resu
         Output:
             - pred_audio:  (B, 1, T)
         """
-        
         def __init__(
             self,
             input_length: int,
@@ -685,24 +689,26 @@ def run_training(config_path: str = f"{WORKDIR}/config.modal.default.yaml", resu
             hidden_size: int = 256,
             num_layers: int = 2,
             dropout: float = 0.1,
-            lr: float = 1e-4,
-            weight_decay: float = 0.0,
             use_params: bool = True,
         ):
             super().__init__()
-            self.save_hyperparameters()
+            self.input_length = input_length
+            self.n_params = n_params
+            self.use_params = use_params
             
-            # Use the model from train.py
-            self.model = BaseLSTMAudioModel(
-                input_length=input_length,
-                n_params=n_params,
+            input_size = 1 + (n_params if use_params and n_params > 0 else 0)
+            
+            self.lstm = torch.nn.LSTM(
+                input_size=input_size,
                 hidden_size=hidden_size,
                 num_layers=num_layers,
-                dropout=dropout,
-                use_params=use_params,
+                dropout=dropout if num_layers > 1 else 0.0,
+                batch_first=True,
             )
+            
+            self.output_proj = torch.nn.Linear(hidden_size, 1)
         
-        def forward(self, x: torch.Tensor, params: Optional[torch.Tensor] = None) -> torch.Tensor:
+        def forward(self, x: torch.Tensor, params: torch.Tensor = None) -> torch.Tensor:
             """
             Args:
                 x:      (B, 1, T) input audio
@@ -710,176 +716,239 @@ def run_training(config_path: str = f"{WORKDIR}/config.modal.default.yaml", resu
             Returns:
                 (B, 1, T) predicted audio
             """
-            return self.model(x, params)
-        
-        def _shared_step(self, batch, stage: str):
-            input_audio, target_audio, params = batch  # (B,1,T), (B,1,T), (B,P)
+            b, c, t = x.shape
+            assert c == 1, "Expected mono audio with shape (B, 1, T)"
             
-            pred_audio = self(input_audio, params)
-            loss = F.mse_loss(pred_audio, target_audio)
+            # Reshape to (B, T, 1)
+            seq = x.transpose(1, 2).contiguous()  # (B, T, 1)
             
-            # Basic metrics
-            mae = F.l1_loss(pred_audio, target_audio)
+            if self.use_params and params is not None and self.n_params > 0:
+                # Create parameter tensor that repeats along time dimension
+                p = params.unsqueeze(1).repeat(1, t, 1)  # (B, T, P)
+                seq = torch.cat([seq, p], dim=-1)  # (B, T, 1+P)
+                seq = seq.contiguous()
             
-            # Audio metrics on first element to keep it cheap
-            with torch.no_grad():
-                metrics = compute_audio_metrics(pred_audio[0], target_audio[0])
+            # Ensure contiguous before LSTM
+            if not seq.is_contiguous():
+                seq = seq.contiguous()
             
-            log_dict = {
-                f"{stage}/loss_mse": loss,
-                f"{stage}/mae": mae,
-                f"{stage}/mse": metrics["mse"],
-                f"{stage}/snr": metrics["snr"],
-                f"{stage}/correlation": metrics["correlation"],
-            }
-            
-            self.log_dict(
-                log_dict,
-                prog_bar=(stage == "train"),
-                on_step=(stage == "train"),
-                on_epoch=True,
-            )
-            return loss
-        
-        def training_step(self, batch, batch_idx):
-            return self._shared_step(batch, "train")
-        
-        def validation_step(self, batch, batch_idx):
-            self._shared_step(batch, "val")
-        
-        def configure_optimizers(self):
-            lr = self.hparams.lr
-            weight_decay = self.hparams.weight_decay
-            scheduler_patience = getattr(self.hparams, "scheduler_patience", 5)
-            scheduler_factor = getattr(self.hparams, "scheduler_factor", 0.5)
-            
-            optimizer = torch.optim.AdamW(self.parameters(), lr=lr, weight_decay=weight_decay)
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=scheduler_factor,
-                patience=scheduler_patience,
-            )
-            
-            return {
-                "optimizer": optimizer,
-                "lr_scheduler": {
-                    "scheduler": scheduler,
-                    "monitor": "val/loss_mse",
-                    "interval": "epoch",
-                    "frequency": 1,
-                },
-            }
+            lstm_out, _ = self.lstm(seq)  # (B, T, H)
+            pred = self.output_proj(lstm_out)  # (B, T, 1)
+            pred = pred.transpose(1, 2).contiguous()  # (B, 1, T)
+            return pred
     
-    # Create model from config
-    print("\nCreating model...")
     model = LSTMAudioModel(
-        input_length=config.model.input_length,
-        n_params=config.model.n_params,
-        hidden_size=config.model.hidden_size,
-        num_layers=config.model.num_layers,
-        dropout=config.model.dropout,
-        lr=config.training.learning_rate,
-        weight_decay=config.training.weight_decay,
-        use_params=config.model.use_params,
+        input_length=train_length,
+        n_params=n_params,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        use_params=use_params,
     )
-    # Store scheduler config in model for configure_optimizers
-    model.hparams.scheduler_patience = config.training.scheduler_patience
-    model.hparams.scheduler_factor = config.training.scheduler_factor
-    print(f"✓ Model created: {sum(p.numel() for p in model.parameters()):,} parameters")
+    print(f"✓ Model created: {model}")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,} total")
     
-    # WandB logger
-    print("\nSetting up WandB logger...")
-    wandb_logger = WandbLogger(
-        project=config.project,
-        name=config.run_name or config.experiment_name,
-        entity=config.wandb_entity,
-        save_dir=config.log_dir,
-        log_model=False,
-        tags=config.tags,
-        offline=True,
+    # Create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
+    # Initialize WandB
+    print("\nInitializing WandB...")
+    run = wandb.init(
+        project="neural-profiler",
+        name=f"lstm-minimal-{hidden_size}h-{num_layers}l",
+        config={
+            "root_dir": root_dir,
+            "train_subset": train_subset,
+            "val_subset": val_subset,
+            "train_length": train_length,
+            "eval_length": eval_length,
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "n_params": n_params,
+            "num_epochs": num_epochs,
+            "learning_rate": learning_rate,
+            "hidden_size": hidden_size,
+            "num_layers": num_layers,
+            "dropout": dropout,
+            "use_params": use_params,
+            "model_params": sum(p.numel() for p in model.parameters()),
+        },
+        mode="online",
     )
-    print("✓ WandB logger configured")
+    print("✓ WandB initialized")
+    print(f"  WandB Run URL: {run.url}")
+    print(f"  WandB Run ID: {run.id}")
+    print(f"  WandB Project: {run.project}")
+    print(f"  WandB Entity: {run.entity}")
     
-    # Callbacks
-    print("\nSetting up callbacks...")
-    checkpoint_callback = ModelCheckpoint(
-        dirpath=config.checkpoint_dir,
-        filename="lstm-audio-{epoch:02d}-{val_loss_mse:.5f}",
-        save_top_k=3,
-        monitor="val/loss_mse",
-        mode="min",
-        save_last=True,
-    )
-    
-    early_stopping = EarlyStopping(
-        monitor="val/loss_mse",
-        mode="min",
-        patience=config.training.early_stopping_patience,
-        verbose=True,
-    )
-    
-    lr_monitor = LearningRateMonitor(logging_interval="epoch")
-    print("✓ Callbacks configured")
-    
-    # Build trainer from config
-    print("\nSetting up trainer...")
-    trainer_kwargs = {
-        "max_epochs": config.training.num_epochs,
-        "logger": wandb_logger,
-        "callbacks": [checkpoint_callback, early_stopping, lr_monitor],
-        "accelerator": config.training.accelerator,
-        "devices": config.training.devices,
-        "precision": config.training.precision,
-        "log_every_n_steps": config.training.log_every_n_steps,
-        "deterministic": config.deterministic,
-    }
-    
-    if config.training.gradient_clip_norm is not None:
-        trainer_kwargs["gradient_clip_val"] = config.training.gradient_clip_norm
-    
-    trainer = pl.Trainer(**trainer_kwargs)
-    print("✓ Trainer configured")
-    
-    # Resume from checkpoint if provided
-    ckpt_path = resume if resume else None
-    
+    # Training loop
     print("\n" + "=" * 80)
-    print("STARTING TRAINING")
+    print("TRAINING")
     print("=" * 80)
     
-    trainer.fit(
-        model,
-        train_dataloaders=train_loader,
-        val_dataloaders=val_loader,
-        ckpt_path=ckpt_path,
-    )
+    # Get total number of batches for progress tracking
+    total_train_batches = len(train_loader)
+    total_val_batches = len(val_loader)
+    
+    for epoch in range(num_epochs):
+        print(f"\nEpoch {epoch + 1}/{num_epochs}")
+        
+        # Training
+        model.train()
+        train_loss = 0.0
+        train_batches = 0
+        
+        # Progress bar for training
+        pbar_train = tqdm(
+            enumerate(train_loader),
+            total=total_train_batches,
+            desc=f"Train Epoch {epoch + 1}/{num_epochs}",
+            unit="batch",
+            ncols=100,
+        )
+        
+        for batch_idx, (input_audio, target_audio, params) in pbar_train:
+            # Forward pass
+            pred_audio = model(input_audio, params)
+            
+            # Compute loss
+            loss = F.mse_loss(pred_audio, target_audio)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+            train_batches += 1
+            avg_loss = train_loss / train_batches
+            
+            # Update progress bar
+            pbar_train.set_postfix({
+                "loss": f"{loss.item():.6f}",
+                "avg_loss": f"{avg_loss:.6f}",
+            })
+            
+            # Log to wandb every 10 batches
+            if (batch_idx + 1) % 10 == 0:
+                wandb.log({
+                    "train/batch_loss": loss.item(),
+                    "train/avg_loss": avg_loss,
+                    "train/epoch": epoch + 1,
+                    "train/batch": batch_idx + 1,
+                })
+        
+        pbar_train.close()
+        avg_train_loss = train_loss / train_batches if train_batches > 0 else 0.0
+        print(f"  Train loss: {avg_train_loss:.6f} ({train_batches} batches)")
+        
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_batches = 0
+        
+        # Progress bar for validation
+        pbar_val = tqdm(
+            enumerate(val_loader),
+            total=total_val_batches,
+            desc=f"Val   Epoch {epoch + 1}/{num_epochs}",
+            unit="batch",
+            ncols=100,
+        )
+        
+        with torch.no_grad():
+            for batch_idx, (input_audio, target_audio, params) in pbar_val:
+                pred_audio = model(input_audio, params)
+                loss = F.mse_loss(pred_audio, target_audio)
+                
+                val_loss += loss.item()
+                val_batches += 1
+                avg_val_loss = val_loss / val_batches
+                
+                # Update progress bar
+                pbar_val.set_postfix({
+                    "loss": f"{loss.item():.6f}",
+                    "avg_loss": f"{avg_val_loss:.6f}",
+                })
+        
+        pbar_val.close()
+        avg_val_loss = val_loss / val_batches if val_batches > 0 else 0.0
+        print(f"  Val loss: {avg_val_loss:.6f} ({val_batches} batches)")
+        
+        # Log epoch metrics to wandb
+        wandb.log({
+            "train/epoch_loss": avg_train_loss,
+            "val/epoch_loss": avg_val_loss,
+            "epoch": epoch + 1,
+        })
+        print(f"  ✓ Logged to WandB: {run.url}")
     
     print("\n" + "=" * 80)
     print("TRAINING COMPLETE")
     print("=" * 80)
-    print(f"Best model saved at: {checkpoint_callback.best_model_path}")
-    print(f"Last model saved at: {checkpoint_callback.last_model_path}")
+    print(f"Final train loss: {avg_train_loss:.6f}")
+    print(f"Final val loss: {avg_val_loss:.6f}")
+    print(f"\nWandB Run URL: {run.url}")
+    
+    # Finish wandb run
+    wandb.finish()
+    print("✓ WandB run finished")
+    
+    return {
+        "final_train_loss": avg_train_loss,
+        "final_val_loss": avg_val_loss,
+        "train_batches": train_batches,
+        "val_batches": val_batches,
+    }
 
 
 @app.local_entrypoint()
 def train(
-    config_path: str = f"{WORKDIR}/config.modal.default.yaml",
-    resume: str | None = None,
+    root_dir: str = "/data/signaltrain/SignalTrain_LA2A_Dataset_1.1",
+    train_subset: str = "Train",
+    val_subset: str = "Val",
+    train_length: int = 65536,
+    eval_length: int = 131072,
+    batch_size: int = 8,
+    num_workers: int = 4,
+    n_params: int = 2,
+    num_epochs: int = 10,
+    learning_rate: float = 1e-4,
+    hidden_size: int = 256,
+    num_layers: int = 2,
+    dropout: float = 0.1,
+    use_params: bool = True,
 ):
-    """Local entrypoint to run training on Modal.
+    """Local entrypoint to run minimal training on Modal.
     
     Usage:
-        # Run training with default config:
+        # Run training with default parameters:
         modal run modal_app.py::train
         
-        # Run training with custom config:
-        modal run modal_app.py::train --config-path /workspace/config.modal.default.yaml
-        
-        # Resume from checkpoint:
-        modal run modal_app.py::train --resume /path/to/checkpoint.ckpt
-        
-        # Both custom config and resume:
-        modal run modal_app.py::train --config-path /workspace/config.modal.default.yaml --resume /path/to/checkpoint.ckpt
+        # Run training with custom parameters:
+        modal run modal_app.py::train --root-dir /data/signaltrain/SignalTrain_LA2A_Dataset_1.1 --num-epochs 10 --batch-size 16
     """
-    run_training.remote(config_path, resume)
+    result = run_training.remote(
+        root_dir=root_dir,
+        train_subset=train_subset,
+        val_subset=val_subset,
+        train_length=train_length,
+        eval_length=eval_length,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        n_params=n_params,
+        num_epochs=num_epochs,
+        learning_rate=learning_rate,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        dropout=dropout,
+        use_params=use_params,
+    )
+    
+    print("\n" + "=" * 80)
+    print("RESULT")
+    print("=" * 80)
+    import json
+    print(json.dumps(result, indent=2))
+    
+    return result

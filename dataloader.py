@@ -6,7 +6,6 @@ including data preprocessing, augmentation, and validation utilities.
 """
 
 import os
-import h5py
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -107,10 +106,38 @@ class SignalTrainLA2ADataset(Dataset):
             f"under {self.subset_dir}"
         )
 
+        # Preload audio data into memory if requested
+        self.preloaded_data = None
         if self.preload:
-            logger.warning(
-                "Preloading is not supported for streaming large WAV files; "
-                "data will be loaded on demand instead."
+            logger.info(f"Preloading {len(self.pairs)} audio files into memory...")
+            self.preloaded_data = []
+            for pair in self.pairs:
+                # Load full audio files
+                input_audio = sf.read(str(pair["input_path"]), dtype="float32")[0]
+                target_audio = sf.read(str(pair["target_path"]), dtype="float32")[0]
+                
+                # Ensure mono (take first channel if stereo)
+                if input_audio.ndim > 1:
+                    input_audio = input_audio[:, 0]
+                if target_audio.ndim > 1:
+                    target_audio = target_audio[:, 0]
+                
+                # Ensure float32
+                input_audio = input_audio.astype(np.float32)
+                target_audio = target_audio.astype(np.float32)
+                
+                self.preloaded_data.append({
+                    "input_audio": input_audio,
+                    "target_audio": target_audio,
+                })
+            
+            total_size_mb = sum(
+                (d["input_audio"].nbytes + d["target_audio"].nbytes) / (1024 * 1024)
+                for d in self.preloaded_data
+            )
+            logger.info(
+                f"✓ Preloaded {len(self.preloaded_data)} audio files "
+                f"({total_size_mb:.2f} MB total)"
             )
 
     def _find_paired_files(self) -> List[Dict[str, Any]]:
@@ -203,10 +230,16 @@ class SignalTrainLA2ADataset(Dataset):
         """
         Convert LA2A state strings from the filename into a numeric parameter vector.
 
-        We keep this flexible so that self.n_params controls the final
-        dimensionality:
-        - Extract numeric values from each state token when possible
-        - Truncate or pad with zeros to match self.n_params
+        For filenames like:
+            target_254_LA2A_2c__1__55.wav
+        the three state tokens are ("2c", "1", "55"), but only the **last two**
+        numbers ("1", "55") are actual parameter values. The leading token ("2c")
+        encodes circuit variant and is **not** a parameter.
+
+        This function therefore:
+        - Extracts numeric values from each state token when possible
+        - Uses the **last `self.n_params` numeric values** as the parameter vector
+        - Pads with zeros if there are fewer numeric values than `self.n_params`
         """
 
         def _extract_numeric(token: str) -> float:
@@ -219,37 +252,55 @@ class SignalTrainLA2ADataset(Dataset):
                     return 0.0
             return 0.0
 
-        full_params = np.array([_extract_numeric(s) for s in states], dtype=np.float32)
+        numeric_values = [_extract_numeric(s) for s in states]
 
         if self.n_params <= 0:
             return np.zeros(0, dtype=np.float32)
 
-        if self.n_params <= len(full_params):
-            return full_params[: self.n_params]
+        # Normalization rules:
+        # - First parameter (index 0): keep as 0-1 (no normalization)
+        # - Second parameter (index 1): 0..100 -> divide by 100 -> 0..1
+        def _normalize_param(index: int, value: float) -> float:
+            # First param: leave in 0-1
+            if index == 0:
+                return float(np.clip(value, 0.0, 1.0))
+            # Second and subsequent params: divide by 100 -> 0..1
+            return float(np.clip(value / 100.0, 0.0, 1.0))
 
-        # Pad with zeros if more parameters are requested than available
+        # Use the last `self.n_params` numeric values (e.g. 1 and 55 from "..._2c__1__55.wav")
+        if self.n_params <= len(numeric_values):
+            selected = numeric_values[-self.n_params :]
+            arr = np.asarray(selected, dtype=np.float32)
+            for i in range(len(arr)):
+                arr[i] = _normalize_param(i, float(arr[i]))
+            return arr.astype(np.float32)
+
+        # Pad with zeros if more parameters are requested than available,
+        # aligning the available values at the end (right-aligned).
         padded = np.zeros(self.n_params, dtype=np.float32)
-        padded[: len(full_params)] = full_params
-        return padded
+        padded[-len(numeric_values) :] = np.asarray(numeric_values, dtype=np.float32)
+        for i in range(len(padded)):
+            padded[i] = _normalize_param(i, float(padded[i]))
+        return padded.astype(np.float32)
     
     def _apply_augmentation(self, input_audio: np.ndarray, target_audio: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Apply data augmentation to audio samples."""
         # Random gain variation
-        if random.random() < 0.3:
-            gain_factor = random.uniform(0.8, 1.2)
-            input_audio *= gain_factor
-            target_audio *= gain_factor
+        # if random.random() < 0.3:
+        #     gain_factor = random.uniform(0.8, 1.2)
+        #     input_audio *= gain_factor
+        #     target_audio *= gain_factor
         
-        # Random phase inversion
-        if random.random() < 0.1:
+        # Random phase inversion (paper: p=0.5)
+        if random.random() < 0.5:
             input_audio *= -1
             target_audio *= -1
         
         # Random time stretching (slight)
-        if random.random() < 0.2:
-            stretch_factor = random.uniform(0.95, 1.05)
-            input_audio = librosa.effects.time_stretch(input_audio, rate=stretch_factor)
-            target_audio = librosa.effects.time_stretch(target_audio, rate=stretch_factor)
+        # if random.random() < 0.2:
+        #     stretch_factor = random.uniform(0.95, 1.05)
+        #     input_audio = librosa.effects.time_stretch(input_audio, rate=stretch_factor)
+        #     target_audio = librosa.effects.time_stretch(target_audio, rate=stretch_factor)
         
         return input_audio, target_audio
     
@@ -279,17 +330,30 @@ class SignalTrainLA2ADataset(Dataset):
             start_sample = random.randint(0, max_start)
             num_samples = segment_length
 
-        # Load audio segments from disk on demand (streaming, not full file)
-        input_audio = self._read_audio_segment(
-            pair["input_path"],
-            start_sample=start_sample,
-            num_samples=num_samples,
-        )
-        target_audio = self._read_audio_segment(
-            pair["target_path"],
-            start_sample=start_sample,
-            num_samples=num_samples,
-        )
+        # Load audio segments from preloaded data or disk
+        if self.preload and self.preloaded_data is not None:
+            # Extract segment from preloaded audio
+            preloaded = self.preloaded_data[idx]
+            input_full = preloaded["input_audio"]
+            target_full = preloaded["target_audio"]
+            
+            # Extract segment (handle edge cases where segment might exceed file length)
+            end_sample = min(start_sample + num_samples, len(input_full))
+            actual_start = min(start_sample, len(input_full))
+            input_audio = input_full[actual_start:end_sample].copy()
+            target_audio = target_full[actual_start:end_sample].copy()
+        else:
+            # Load audio segments from disk on demand (streaming, not full file)
+            input_audio = self._read_audio_segment(
+                pair["input_path"],
+                start_sample=start_sample,
+                num_samples=num_samples,
+            )
+            target_audio = self._read_audio_segment(
+                pair["target_path"],
+                start_sample=start_sample,
+                num_samples=num_samples,
+            )
 
         # Ensure mono NumPy arrays
         input_audio = np.asarray(input_audio, dtype=np.float32).flatten()
@@ -450,23 +514,19 @@ def validate_dataset_structure(root_dir: str) -> Dict[str, Any]:
             results['errors'].append(f"Missing subset directory: {subset}")
         else:
             # Count files in subset
-            h5_files = list(subset_dir.glob("*.h5"))
             wav_files = list(subset_dir.glob("*.wav"))
             results['stats'][subset] = {
-                'h5_files': len(h5_files),
                 'wav_files': len(wav_files),
-                'total_files': len(h5_files) + len(wav_files)
+                'total_files': len(wav_files)
             }
     
     # Check for test subset (optional)
     test_dir = root_path / 'Test'
     if test_dir.exists():
-        h5_files = list(test_dir.glob("*.h5"))
         wav_files = list(test_dir.glob("*.wav"))
         results['stats']['test'] = {
-            'h5_files': len(h5_files),
             'wav_files': len(wav_files),
-            'total_files': len(h5_files) + len(wav_files)
+            'total_files': len(wav_files)
         }
     
     return results

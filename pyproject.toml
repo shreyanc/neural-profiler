@@ -20,7 +20,10 @@ dependencies = [
     "pydantic>=2.12.5",
     "boto3>=1.42.32",
     "jwt>=1.4.0",
-    "wandb>=0.24.0",
+    "mlflow>=3.10.0",
+    "auraloss[all]>=0.4.0",
+    "pyloudnorm>=0.2.0",
+    "wandb>=0.25.1",
 ]
 
 
@@ -41,6 +44,11 @@ dev = [
     "pytest>=7.4.0",
     "ruff>=0.1.0",
     "ipython>=8.12.0",
+]
+
+# Experiment tracking (for MLflow logging to Databricks or any tracking server)
+mlflow = [
+    "mlflow>=2.0.0",
 ]
 
 # Configure which PyTorch index to use for each extra
