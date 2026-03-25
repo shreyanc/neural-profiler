@@ -152,13 +152,15 @@ class SignalTrainLA2ADatasetSingle(torch.utils.data.Dataset):
 
 
 class LSTMmodeler(torch.nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, block_size):
+    def __init__(self, input_size, hidden_size, output_size, block_size, num_layers=1):
         super().__init__()
         # input size is 1 for mono audio and 2 for stereo audio
-        self.lstm = torch.nn.LSTM(input_size, hidden_size, batch_first=True)
+        self.lstm = torch.nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True)
         self.fc = torch.nn.Linear(hidden_size, output_size)
         self.block_size = block_size
         self.hidden_size = hidden_size
+        self.name = "lstm"
+        self.num_layers = num_layers
 
     def process_in_blocks(self, seq: torch.Tensor, hidden_state=None):
         outputs = []
@@ -180,6 +182,108 @@ class LSTMmodeler(torch.nn.Module):
         x = self.fc(x)
         return x.transpose(1, 2).contiguous()
 
+class ResidualLSTMmodeler(torch.nn.Module):
+    def __init__(self, input_size, hidden_size, output_size, block_size, num_layers=1):
+        super().__init__()
+        # input size is 1 for mono audio and 2 for stereo audio
+        self.lstm = torch.nn.LSTM(input_size, hidden_size, num_layers=num_layers, batch_first=True)
+        self.fc = torch.nn.Linear(hidden_size, output_size)
+        self.num_layers = num_layers
+        self.block_size = block_size
+        self.hidden_size = hidden_size
+        self.name = "residual_lstm"
+    def process_in_blocks(self, seq: torch.Tensor, hidden_state=None):
+        outputs = []
+        for i in range(0, seq.shape[1], self.block_size):
+            chunk = seq[:, i : i + self.block_size, :]
+            out, hidden_state = self.lstm(chunk, hidden_state)
+            outputs.append(out)
+        return torch.cat(outputs, dim=1), hidden_state
+
+    def forward(self, x):
+        B, C, T = x.shape
+        assert C == 1, f"Expected mono audio (C=1), got C={C}"
+
+        # (B, 1, T) -> (B, T, 1)
+        # x_seq should be of shape (batch_size, sequence_length, input_size)
+        x_seq = x.transpose(1, 2).contiguous()
+
+        x, _ = self.process_in_blocks(x_seq, hidden_state=None)
+        delta = self.fc(x)
+        output = x_seq + delta
+        return output.transpose(1, 2).contiguous()
+
+
+def create_loss_function(loss_type: str, sample_rate: int = 44100):
+    """
+    Create a loss function based on the specified loss type.
+    
+    Supported loss types:
+    - MAE: Mean Absolute Error (L1 loss)
+    - MSE: Mean Squared Error (L2 loss)
+    - STFT: Short-Time Fourier Transform loss
+    - L1+STFT: Combined L1 and STFT loss
+    - ESR: Error-to-Signal Ratio loss
+    - DC: DC error loss
+    - ESR+DC: Combined ESR and DC loss
+    
+    Args:
+        loss_type: String specifying the loss type (case-insensitive)
+        sample_rate: Sample rate for audio (used for STFT-based losses)
+    
+    Returns:
+        A callable loss function that takes (pred, target) tensors
+    """
+    import auraloss
+    
+    loss_type = loss_type.strip().upper()
+    
+    if loss_type == "MAE":
+        return torch.nn.L1Loss()
+    
+    elif loss_type == "MSE":
+        return torch.nn.MSELoss()
+    
+    elif loss_type == "STFT":
+        return auraloss.freq.STFTLoss(
+            fft_size=1024,
+            hop_size=256,
+            win_length=1024,
+            sample_rate=sample_rate,
+        )
+    
+    elif loss_type == "L1+STFT":
+        l1_loss = torch.nn.L1Loss()
+        stft_loss = auraloss.freq.STFTLoss(
+            fft_size=1024,
+            hop_size=256,
+            win_length=1024,
+            sample_rate=sample_rate,
+        )
+        def combined_loss(pred, target):
+            return l1_loss(pred, target) + stft_loss(pred, target)
+        return combined_loss
+    
+    elif loss_type == "ESR":
+        return auraloss.time.ESRLoss()
+    
+    elif loss_type == "DC":
+        return auraloss.time.DCLoss()
+    
+    elif loss_type == "ESR+DC":
+        esr_loss = auraloss.time.ESRLoss()
+        dc_loss = auraloss.time.DCLoss()
+        def combined_loss(pred, target):
+            return esr_loss(pred, target) + dc_loss(pred, target)
+        return combined_loss
+    
+    else:
+        raise ValueError(
+            f"Unsupported loss type: {loss_type}. "
+            f"Supported types: MAE, MSE, STFT, L1+STFT, ESR, DC, ESR+DC"
+        )
+
+
 @app.function(
     image=image,
     gpu="A10G",  # Use A10G GPU for training
@@ -199,10 +303,25 @@ def train_minimal_model(
     batch_size: int = 2,
     val_batch_size: int = 1,
     test_batch_size: int = 1,
+    model_name: str = "residual_lstm",
     hidden_size: int = 128,
+    num_layers: int = 1,
     block_size: int = 2048,
     learning_rate: float = 0.001,
     num_epochs: int = 1,
+    train_loss_type: str = "MSE",
+    val_loss_type: str = "MSE",
+    # TCNModel-specific parameters
+    nparams: int = 0,
+    nblocks: int = 10,
+    kernel_size: int = 3,
+    dilation_growth: int = 1,
+    channel_growth: int = 1,
+    channel_width: int = 32,
+    stack_size: int = 10,
+    grouped: bool = False,
+    causal: bool = False,
+    skip_connections: bool = False,
 ):
     """
     Train the minimal LSTM model on Modal.
@@ -215,6 +334,9 @@ def train_minimal_model(
     
     # Ensure project code is on PYTHONPATH inside the container
     sys.path.insert(0, WORKDIR)
+    
+    # Import TCNModel from models.py
+    from models import TCNModel
     
     print("=" * 80)
     print("MINIMAL TRAINING ON MODAL")
@@ -230,6 +352,8 @@ def train_minimal_model(
     print(f"Block size: {block_size}")
     print(f"Learning rate: {learning_rate}")
     print(f"Num epochs: {num_epochs}")
+    print(f"Train loss type: {train_loss_type}")
+    print(f"Val loss type: {val_loss_type}")
     print("=" * 80)
     
     # Check GPU availability
@@ -268,7 +392,29 @@ def train_minimal_model(
     
     # Create model and optimizer - core implementation logic unchanged
     print("\nCreating model...")
-    model = LSTMmodeler(input_size=1, hidden_size=hidden_size, output_size=1, block_size=block_size)
+
+    if model_name == "residual_lstm":
+        model = ResidualLSTMmodeler(input_size=1, hidden_size=hidden_size, output_size=1, block_size=block_size)
+    elif model_name == "lstm":
+        model = LSTMmodeler(input_size=1, hidden_size=hidden_size, output_size=1, block_size=block_size)
+    elif model_name == "tcn":
+        model = TCNModel(
+            nparams=nparams,
+            ninputs=1,
+            noutputs=1,
+            nblocks=nblocks,
+            kernel_size=kernel_size,
+            dilation_growth=dilation_growth,
+            channel_growth=channel_growth,
+            channel_width=channel_width,
+            stack_size=stack_size,
+            grouped=grouped,
+            causal=causal,
+            skip_connections=skip_connections,
+            learning_rate=learning_rate,
+        )
+    else:
+        raise ValueError(f"Invalid model name: {model_name}. Supported: 'lstm', 'residual_lstm', 'tcn'")
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
     # Move model to GPU if available
@@ -278,11 +424,26 @@ def train_minimal_model(
     
     print(f"✓ Model created: {sum(p.numel() for p in model.parameters()):,} parameters")
     
+    # Create loss functions
+    print("\nCreating loss functions...")
+    train_loss_fn = create_loss_function(train_loss_type, sample_rate)
+    val_loss_fn = create_loss_function(val_loss_type, sample_rate)
+    
+    # Move loss functions to GPU if available (for auraloss losses)
+    if gpu_available:
+        if hasattr(train_loss_fn, 'cuda'):
+            train_loss_fn = train_loss_fn.cuda()
+        if hasattr(val_loss_fn, 'cuda'):
+            val_loss_fn = val_loss_fn.cuda()
+    
+    print(f"✓ Training loss: {train_loss_type}")
+    print(f"✓ Validation loss: {val_loss_type}")
+    
     # Initialize WandB
     print("\nInitializing WandB...")
     run = wandb.init(
         project="neural-profiler",
-        name=f"lstm-minimal-{hidden_size}h-bs{block_size}-clip{clip_idx}",
+        name=f"{model_name}-minimal-{hidden_size}h-layers{num_layers}-bs{block_size}-{train_loss_type}-{val_loss_type}-epochs{num_epochs}",
         config={
             "root_dir": root_dir,
             "subset_dir_name": subset_dir_name,
@@ -295,8 +456,12 @@ def train_minimal_model(
             "test_batch_size": test_batch_size,
             "hidden_size": hidden_size,
             "block_size": block_size,
+            "num_layers": num_layers,
             "learning_rate": learning_rate,
             "num_epochs": num_epochs,
+            "train_loss_type": train_loss_type,
+            "val_loss_type": val_loss_type,
+            "model_name": model_name,
             "model_params": sum(p.numel() for p in model.parameters()),
         },
         mode="online",
@@ -329,8 +494,11 @@ def train_minimal_model(
             
             optimizer.zero_grad()
             pred_audio = model(input_audio.unsqueeze(1))
-            # print(input_audio.unsqueeze(1).shape, pred_audio.shape, target_audio.unsqueeze(1).shape)
-            loss = torch.nn.functional.mse_loss(pred_audio, target_audio.unsqueeze(1))
+            target_audio_expanded = target_audio.unsqueeze(1)
+            # print(input_audio.unsqueeze(1).shape, pred_audio.shape, target_audio_expanded.shape)
+            
+            # Use configurable training loss
+            loss = train_loss_fn(pred_audio, target_audio_expanded)
             # print(f"Batch {idx}, Loss: {loss.item():.6f}")
             loss.backward()
             optimizer.step()
@@ -364,7 +532,10 @@ def train_minimal_model(
                     target_audio = target_audio.cuda()
                 
                 pred_audio = model(input_audio.unsqueeze(1))
-                batch_val_loss = torch.nn.functional.mse_loss(pred_audio, target_audio.unsqueeze(1)).item()
+                target_audio_expanded = target_audio.unsqueeze(1)
+                
+                # Use configurable validation loss
+                batch_val_loss = val_loss_fn(pred_audio, target_audio_expanded).item()
                 val_loss += batch_val_loss
                 val_batches += 1
                 # print(f"Batch {idx}, Val Loss: {batch_val_loss:.6f}")
@@ -384,7 +555,10 @@ def train_minimal_model(
                     target_audio = target_audio.cuda()
                 
                 pred_audio = model(input_audio.unsqueeze(1))
-                batch_test_loss = torch.nn.functional.mse_loss(pred_audio, target_audio.unsqueeze(1)).item()
+                target_audio_expanded = target_audio.unsqueeze(1)
+                
+                # Use validation loss function for test set as well
+                batch_test_loss = val_loss_fn(pred_audio, target_audio_expanded).item()
                 test_loss += batch_test_loss
                 test_batches += 1
                 # print(f"Batch {idx}, Test Loss: {batch_test_loss:.6f}")
@@ -407,6 +581,87 @@ def train_minimal_model(
     print(f"Final val loss: {avg_val_loss:.6f}")
     print(f"Final test loss: {avg_test_loss:.6f}")
     print(f"\nWandB Run URL: {run.url}")
+    
+    # Compute test metrics using auraloss
+    print("\n" + "=" * 80)
+    print("COMPUTING TEST METRICS")
+    print("=" * 80)
+    
+    import auraloss
+    import pyloudnorm as pyln
+    
+    l1_fn = torch.nn.L1Loss()
+    stft_fn = auraloss.freq.STFTLoss()
+    meter = pyln.Meter(sample_rate)
+    
+    mae_scores = []
+    stft_scores = []
+    lufs_diff_scores = []
+    
+    model.eval()
+    with torch.no_grad():
+        for idx, batch in enumerate(test_dataloader):
+            input_audio, target_audio = batch
+            
+            # Move to GPU if available
+            if gpu_available:
+                input_audio = input_audio.cuda()
+                target_audio = target_audio.cuda()
+            
+            pred_audio = model(input_audio.unsqueeze(1))
+            
+            # Compute metrics for each item in the batch
+            for i in range(pred_audio.shape[0]):
+                pred_item = pred_audio[i:i+1]  # (1, 1, T)
+                target_item = target_audio[i:i+1].unsqueeze(1)  # (1, 1, T)
+                
+                # MAE (Mean Absolute Error)
+                mae = l1_fn(pred_item, target_item).item()
+                mae_scores.append(mae)
+                
+                # STFT loss
+                stft_val = stft_fn(pred_item, target_item).item()
+                stft_scores.append(stft_val)
+                
+                # LUFS difference
+                target_np = target_item.squeeze().detach().cpu().numpy()
+                pred_np = pred_item.squeeze().detach().cpu().numpy()
+                
+                try:
+                    target_lufs = meter.integrated_loudness(target_np)
+                    output_lufs = meter.integrated_loudness(pred_np)
+                    lufs_diff = float(abs(output_lufs - target_lufs))
+                    lufs_diff_scores.append(lufs_diff)
+                except Exception as e:
+                    # Skip LUFS computation if audio is too quiet or invalid
+                    print(f"  ⚠ Skipping LUFS for batch {idx}, item {i}: {e}")
+    
+    if mae_scores:
+        mean_mae = float(np.mean(mae_scores))
+        mean_stft = float(np.mean(stft_scores))
+        mean_lufs_diff = float(np.mean(lufs_diff_scores)) if lufs_diff_scores else None
+        
+        print("-" * 64)
+        print("TEST METRICS (mean over test set)")
+        print(f"MAE:        {mean_mae:0.4e}")
+        print(f"STFT:       {mean_stft:0.4f}")
+        if mean_lufs_diff is not None:
+            print(f"dB LUFS Δ:  {mean_lufs_diff:0.4f}")
+        else:
+            print(f"dB LUFS Δ:  N/A (could not compute)")
+        
+        # Log to wandb
+        test_metrics = {
+            "test/mae": mean_mae,
+            "test/stft": mean_stft,
+        }
+        if mean_lufs_diff is not None:
+            test_metrics["test/lufs_db"] = mean_lufs_diff
+        
+        wandb.log(test_metrics)
+        print(f"✓ Logged test metrics to WandB")
+    else:
+        print("⚠ No test samples found for evaluation.")
     
     # Plot the last three segments from test set
     print("\n" + "=" * 80)
@@ -530,20 +785,40 @@ def train(
     batch_size: int = 1,
     val_batch_size: int = 1,
     test_batch_size: int = 1,
-    hidden_size: int = 128,
+    model_name: str = "residual_lstm",
+    hidden_size: int = 64,
+    num_layers: int = 2,
     block_size: int = 2048,
-    learning_rate: float = 0.001,
+    learning_rate: float = 0.0001,
     num_epochs: int = 1,
+    train_loss_type: str = "ESR+DC",
+    val_loss_type: str = "MSE",
+    # TCNModel-specific parameters
+    nparams: int = 0,
+    nblocks: int = 10,
+    kernel_size: int = 3,
+    dilation_growth: int = 1,
+    channel_growth: int = 1,
+    channel_width: int = 32,
+    stack_size: int = 10,
+    grouped: bool = False,
+    causal: bool = False,
+    skip_connections: bool = False,
 ):
     """
     Local entrypoint to run minimal training on Modal.
     
     Usage:
-        # Run with default parameters:
+        # Run with default parameters (MSE for both train and val):
         modal run train_minimal.py::train
         
         # Run with custom parameters:
         modal run train_minimal.py::train --num-epochs 10 --batch-size 4 --clip-idx 100
+        
+        # Run with custom loss functions:
+        modal run train_minimal.py::train --train-loss-type STFT --val-loss-type MAE
+        
+    Supported loss types: MAE, MSE, STFT, L1+STFT, ESR, DC, ESR+DC
     """
     result = train_minimal_model.remote(
         root_dir=root_dir,
@@ -555,10 +830,24 @@ def train(
         batch_size=batch_size,
         val_batch_size=val_batch_size,
         test_batch_size=test_batch_size,
+        model_name=model_name,
         hidden_size=hidden_size,
+        num_layers=num_layers,
         block_size=block_size,
         learning_rate=learning_rate,
         num_epochs=num_epochs,
+        train_loss_type=train_loss_type,
+        val_loss_type=val_loss_type,
+        nparams=nparams,
+        nblocks=nblocks,
+        kernel_size=kernel_size,
+        dilation_growth=dilation_growth,
+        channel_growth=channel_growth,
+        channel_width=channel_width,
+        stack_size=stack_size,
+        grouped=grouped,
+        causal=causal,
+        skip_connections=skip_connections,
     )
     
     print("\n" + "=" * 80)
@@ -588,7 +877,7 @@ if __name__ == "__main__":
     test_dataset = SignalTrainLA2ADatasetSingle(ROOT_DIR, SUBSET_DIR_NAME, "test", CLIP_IDX, SEGMENT_LENGTH, SAMPLE_RATE)
     test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=1, shuffle=False)
 
-    model = LSTMmodeler(input_size=1, hidden_size=128, output_size=1, block_size=2048)
+    model = ResidualLSTMmodeler(input_size=1, hidden_size=128, output_size=1, block_size=2048)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
     for epoch in range(1):
