@@ -11,42 +11,17 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pathlib import Path
 
+from modal_common import (
+    DATASET_MOUNT,
+    WORKDIR,
+    image_signaltrain_training,
+    make_signaltrain_volume,
+)
+
 APP_NAME = "train-step-by-step"
-WORKDIR = "/workspace"
-DATASET_MOUNT = "/data/signaltrain"
 
-# Persistent volume for the SignalTrain dataset
-signaltrain_volume = modal.Volume.from_name(
-    "signaltrain-dataset", create_if_missing=False
-)
-
-# Base image with dependencies for PyTorch Lightning and dataloader
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .uv_pip_install(
-        # Core dependencies for dataloader
-        "numpy>=2.3.3",
-        "librosa>=0.10.0",
-        "soundfile>=0.12.0",
-        "scipy>=1.11.0",
-        "pyyaml>=6.0.0",
-        # Torch stack
-        "torch>=2.1.2",
-        "torchvision>=0.16.1",
-        # PyTorch Lightning
-        "pytorch-lightning>=2.0.0",
-        # Plotting
-        "matplotlib>=3.10.0",
-        # Experiment tracking (optional: set MLFLOW_TRACKING_URI to enable)
-        "mlflow>=2.0.0",
-        # Audio-focused loss functions (STFT, ESR, DC, etc.)
-        "auraloss[all]>=0.4.0",
-        # Loudness metrics (for LUFS-based evaluation)
-        "pyloudnorm>=0.1.0",
-    )
-    # Include project code so dataloader and configs can be imported
-    .add_local_dir(Path(__file__).parent, remote_path=WORKDIR)
-)
+signaltrain_volume = make_signaltrain_volume(create_if_missing=False)
+image = image_signaltrain_training()
 
 app = modal.App(APP_NAME)
 

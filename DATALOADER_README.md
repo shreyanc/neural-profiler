@@ -51,19 +51,9 @@ for input_audio, target_audio, params in train_loader:
     pass
 ```
 
-### Using Configuration Files
+### Configuration
 
-```python
-from config import get_default_config, load_config_from_yaml
-
-# Load from YAML file
-config = load_config_from_yaml("config.yaml")
-
-# Or use predefined configurations
-config = get_default_config("/path/to/dataset")
-config = get_small_config("/path/to/dataset")  # For quick testing
-config = get_large_config("/path/to/dataset")  # For full training
-```
+Training scripts use `DatasetConfig` from this module (see `dataloader.DatasetConfig`) or YAML loaded by [train_step_by_step.py](train_step_by_step.py) (e.g. [config.train_step_by_step.yaml](config.train_step_by_step.yaml)). The legacy `config.py` / `train.py` stack has been removed.
 
 ## Dataset Structure
 
@@ -197,32 +187,18 @@ class TrainingConfig:
 
 ## Examples
 
-### Complete Training Example
+### Training entrypoints
 
-See `example_usage.py` for a complete training example with:
-- Model definition
-- Training loop
-- Validation
-- Metrics computation
-
-### Synthetic Data Demo
-
-If you don't have the actual dataset, you can run the demo with synthetic data:
-
-```python
-python example_usage.py
-```
-
-This will create synthetic audio data and demonstrate the dataloader functionality.
+Use [train_step_by_step.py](train_step_by_step.py) or [train_minimal.py](train_minimal.py) on Modal, or construct `DatasetConfig` and `create_dataloaders` locally as shown above.
 
 ### Configuration Examples
 
 ```python
 # Small config for quick testing
-config = get_small_config("/path/to/dataset")
+config = DatasetConfig(root_dir="/path/to/dataset", batch_size=4)
 
 # Large config for full training
-config = get_large_config("/path/to/dataset")
+config = DatasetConfig(root_dir="/path/to/dataset", train_length=131072, batch_size=16)
 
 # Custom config
 config = DatasetConfig(

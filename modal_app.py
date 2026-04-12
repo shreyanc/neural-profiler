@@ -10,43 +10,17 @@ from pathlib import Path
 
 import modal
 
+from modal_common import (
+    DATASET_MOUNT,
+    WORKDIR,
+    image_neural_profiler_app,
+    make_signaltrain_volume,
+)
+
 APP_NAME = "neural-profiler-train"
-WORKDIR = "/workspace"
-DATASET_MOUNT = "/data/signaltrain"
 
-# Persistent volume for the SignalTrain dataset
-signaltrain_volume = modal.Volume.from_name(
-    "signaltrain-dataset", create_if_missing=True
-)
-
-# Base image with runtime dependencies (GPU-enabled)
-image = (
-    modal.Image.debian_slim(python_version="3.11")
-    .apt_install("awscli")  # AWS CLI for S3 access
-    .uv_pip_install(
-        # Core deps
-        "numpy>=2.3.3",
-        "librosa>=0.10.0",
-        "soundfile>=0.12.0",
-        "h5py>=3.8.0",
-        "scipy>=1.11.0",
-        "pyyaml>=6.0.0",
-        "ipykernel>=7.1.0",
-        "matplotlib>=3.10.8",
-        "ipywidgets>=8.1.8",
-        "jupyterlab-widgets>=3.0.16",
-        # AWS SDK
-        "boto3>=1.34.0",
-        # Torch stack (GPU / CUDA 12.8)
-        "torch>=2.1.2",
-        "torchvision>=0.16.1",
-        # Training stack
-        "wandb>=0.16.0",
-        "tqdm>=4.66.0",
-    )
-    # Include project code so imports resolve even outside the mounted path
-    .add_local_dir(Path(__file__).parent, remote_path=WORKDIR)
-)
+signaltrain_volume = make_signaltrain_volume(create_if_missing=True)
+image = image_neural_profiler_app()
 
 app = modal.App(APP_NAME)
 

@@ -1,6 +1,6 @@
 """Run folder naming and initialization for training scripts.
 
-Shared utilities so different train scripts (e.g. train_step_by_step.py, train.py)
+Shared utilities so different train scripts (e.g. train_step_by_step.py)
 can create consistent, filesystem-safe run directories with datetime prefixes.
 """
 
